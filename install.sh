@@ -26,7 +26,7 @@ err() {
 }
 
 info() {
-  echo "[INFO] $*"
+  echo "[INFO] $*" >&2
 }
 
 need_root() {
