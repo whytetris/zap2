@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
+SCRIPT_NAME="$(basename "$0")"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+
+# Optional: pass repo URL. If omitted, installer uses current script directory as project root.
 REPO_URL="${1:-}"
-if [[ -z "${REPO_URL}" ]]; then
-  echo "Usage: sudo bash zap2-auto.sh <github_repo_url>"
-  echo "Example: sudo bash zap2-auto.sh https://github.com/vernette/ss-zapret.git"
-  exit 1
-fi
 
 # ====== configurable defaults (override via env if you want) ======
 INSTALL_DIR="${INSTALL_DIR:-/opt/ss-zapret}"
@@ -21,9 +20,17 @@ REDSOCKS_PORT="${REDSOCKS_PORT:-12345}"
 TCP_PORTS="${TCP_PORTS:-80,443}"      # which TCP ports to send via socks
 # ================================================================
 
+err() {
+  echo "[ERROR] $*" >&2
+}
+
+info() {
+  echo "[INFO] $*"
+}
+
 need_root() {
   if [[ "${EUID}" -ne 0 ]]; then
-    echo "Run as root: sudo bash $0 <repo_url>"
+    err "Run as root: sudo bash ${SCRIPT_NAME} [repo_url]"
     exit 1
   fi
 }
@@ -48,7 +55,6 @@ detect_local_ip() {
 }
 
 detect_public_ip() {
-  # best-effort
   local ip=""
   for url in \
     "https://api.ipify.org" \
@@ -74,111 +80,162 @@ set_env_kv() {
 }
 
 tcp_ports_to_nft_set() {
-  # "80,443" -> "{80,443}"
   local x="${1// /}"
   echo "{${x}}"
 }
 
-need_root
+install_pkgs() {
+  export DEBIAN_FRONTEND=noninteractive
 
-echo "[0] Detecting network..."
-DEF_IF="$(detect_default_iface || true)"
-if [[ -z "${DEF_IF}" ]]; then
-  echo "Could not detect default interface. Check: ip route"
+  if have_cmd apt-get; then
+    info "Installing packages via apt-get..."
+    apt-get update -y
+    apt-get install -y --no-install-recommends \
+      ca-certificates curl git nano \
+      docker.io docker-compose-plugin \
+      wireguard nftables redsocks \
+      iproute2 tcpdump openssl
+  elif have_cmd dnf; then
+    info "Installing packages via dnf..."
+    dnf install -y \
+      ca-certificates curl git nano \
+      docker docker-compose-plugin \
+      wireguard-tools nftables redsocks \
+      iproute tcpdump openssl
+  else
+    err "Unsupported package manager. Need apt-get or dnf."
+    exit 1
+  fi
+}
+
+enable_service() {
+  local svc="$1"
+  systemctl enable --now "$svc" || {
+    err "Failed to enable/start service: ${svc}"
+    return 1
+  }
+}
+
+ensure_docker_ready() {
+  enable_service docker
+
+  if docker info >/dev/null 2>&1; then
+    return 0
+  fi
+
+  sleep 2
+  docker info >/dev/null 2>&1 || {
+    err "Docker daemon is not ready"
+    exit 1
+  }
+}
+
+ensure_compose() {
+  if docker compose version >/dev/null 2>&1; then
+    return 0
+  fi
+  err "Docker Compose plugin is not available (docker compose)."
   exit 1
-fi
-LOCAL_CIDR="$(detect_local_ip "$DEF_IF")"
-LOCAL_IP="${LOCAL_CIDR%%/*}"
-PUB_IP="$(detect_public_ip || true)"
+}
 
-echo "  default iface: ${DEF_IF}"
-echo "  local ip:      ${LOCAL_CIDR:-unknown}"
-echo "  public ip:     ${PUB_IP:-unknown (will ask later)}"
-echo
+resolve_project_dir() {
+  if [[ -n "${REPO_URL}" ]]; then
+    info "Using repository URL: ${REPO_URL}"
+    rm -rf "${INSTALL_DIR}"
+    git clone "${REPO_URL}" "${INSTALL_DIR}"
+    echo "${INSTALL_DIR}"
+    return
+  fi
 
-echo "[1] Installing packages (docker, wireguard, redsocks, nftables)..."
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y --no-install-recommends \
-  ca-certificates curl git nano \
-  docker.io docker-compose-plugin \
-  wireguard nftables redsocks \
-  iproute2 tcpdump openssl
+  if [[ -f "${SCRIPT_DIR}/docker-compose.yml" || -f "${SCRIPT_DIR}/docker-compose.yaml" ]]; then
+    info "Using local project from script directory: ${SCRIPT_DIR}"
+    echo "${SCRIPT_DIR}"
+    return
+  fi
 
-systemctl enable --now docker
+  err "No repo URL provided and docker-compose file not found near script."
+  err "Usage: sudo bash ${SCRIPT_NAME} <github_repo_url>"
+  exit 1
+}
 
-echo "[2] Cloning repo: ${REPO_URL}"
-rm -rf "${INSTALL_DIR}"
-git clone "${REPO_URL}" "${INSTALL_DIR}"
-cd "${INSTALL_DIR}"
+prepare_project_env() {
+  local proj_dir="$1"
+  cd "${proj_dir}"
 
-# prepare .env/config (best effort for vernette/ss-zapret* style)
-if [[ -f ".env.example" && ! -f ".env" ]]; then
-  cp .env.example .env
-elif [[ -f ".env.sample" && ! -f ".env" ]]; then
-  cp .env.sample .env
-elif [[ ! -f ".env" ]]; then
-  # create minimal .env if repo doesn't have an example
-  cat > .env <<EOF
+  if [[ -f ".env.example" && ! -f ".env" ]]; then
+    cp .env.example .env
+  elif [[ -f ".env.sample" && ! -f ".env" ]]; then
+    cp .env.sample .env
+  elif [[ ! -f ".env" ]]; then
+    cat > .env <<EOF
 SOCKS_PORT=${SOCKS_PORT}
 SS_PORT=8388
 SS_PASSWORD=$(rand_pw)
 SS_ENCRYPT_METHOD=chacha20-ietf-poly1305
 SS_TIMEOUT=300
 EOF
-fi
-
-if [[ -f "config.default" && ! -f "config" ]]; then
-  cp config.default config
-fi
-
-# set SOCKS_PORT and SS_PASSWORD if present/empty-ish
-if [[ -f ".env" ]]; then
-  set_env_kv ".env" "SOCKS_PORT" "${SOCKS_PORT}"
-
-  if grep -qE '^SS_PASSWORD=' .env; then
-    CURPW="$(grep -E '^SS_PASSWORD=' .env | head -n1 | cut -d= -f2- || true)"
-    if [[ -z "${CURPW}" || "${CURPW}" == "changeme" ]]; then
-      set_env_kv ".env" "SS_PASSWORD" "$(rand_pw)"
-    fi
-  else
-    echo "SS_PASSWORD=$(rand_pw)" >> .env
   fi
-fi
 
-echo "[3] Starting docker compose..."
-docker compose up -d
-docker compose ps
+  if [[ -f "config.default" && ! -f "config" ]]; then
+    cp config.default config
+  fi
 
-echo "[4] WireGuard: generating keys (server + MikroTik peer)..."
-install -d -m 700 /etc/wireguard
+  if [[ -f ".env" ]]; then
+    set_env_kv ".env" "SOCKS_PORT" "${SOCKS_PORT}"
 
-# server keys
-if [[ ! -f "/etc/wireguard/server.key" ]]; then
-  umask 077
-  wg genkey | tee /etc/wireguard/server.key | wg pubkey > /etc/wireguard/server.pub
-fi
-SERVER_PRIV="$(cat /etc/wireguard/server.key)"
-SERVER_PUB="$(cat /etc/wireguard/server.pub)"
+    if grep -qE '^SS_PASSWORD=' .env; then
+      local curpw
+      curpw="$(grep -E '^SS_PASSWORD=' .env | head -n1 | cut -d= -f2- || true)"
+      if [[ -z "${curpw}" || "${curpw}" == "changeme" ]]; then
+        set_env_kv ".env" "SS_PASSWORD" "$(rand_pw)"
+      fi
+    else
+      echo "SS_PASSWORD=$(rand_pw)" >> .env
+    fi
+  fi
+}
 
-# MikroTik keys (we generate them so you can just paste to MT)
-if [[ ! -f "/etc/wireguard/mikrotik.key" ]]; then
-  umask 077
-  wg genkey | tee /etc/wireguard/mikrotik.key | wg pubkey > /etc/wireguard/mikrotik.pub
-fi
-MT_PRIV="$(cat /etc/wireguard/mikrotik.key)"
-MT_PUB="$(cat /etc/wireguard/mikrotik.pub)"
+start_compose() {
+  local proj_dir="$1"
+  cd "${proj_dir}"
 
-echo "[5] Enabling forwarding + rp_filter..."
-cat >/etc/sysctl.d/99-zap2.conf <<'EOF'
+  if [[ -f "docker-compose.yml" || -f "docker-compose.yaml" ]]; then
+    docker compose up -d
+    docker compose ps
+  else
+    err "No docker-compose.yml/yaml in ${proj_dir}"
+    exit 1
+  fi
+}
+
+configure_wireguard() {
+  info "WireGuard: generating keys (server + MikroTik peer)..."
+  install -d -m 700 /etc/wireguard
+
+  if [[ ! -f "/etc/wireguard/server.key" ]]; then
+    umask 077
+    wg genkey | tee /etc/wireguard/server.key | wg pubkey > /etc/wireguard/server.pub
+  fi
+  SERVER_PRIV="$(cat /etc/wireguard/server.key)"
+  SERVER_PUB="$(cat /etc/wireguard/server.pub)"
+
+  if [[ ! -f "/etc/wireguard/mikrotik.key" ]]; then
+    umask 077
+    wg genkey | tee /etc/wireguard/mikrotik.key | wg pubkey > /etc/wireguard/mikrotik.pub
+  fi
+  MT_PRIV="$(cat /etc/wireguard/mikrotik.key)"
+  MT_PUB="$(cat /etc/wireguard/mikrotik.pub)"
+
+  info "Enabling forwarding + rp_filter..."
+  cat >/etc/sysctl.d/99-zap2.conf <<'EOF'
 net.ipv4.ip_forward=1
 net.ipv4.conf.all.rp_filter=0
 net.ipv4.conf.default.rp_filter=0
 EOF
-sysctl --system >/dev/null
+  sysctl --system >/dev/null
 
-echo "[6] Writing WireGuard config /etc/wireguard/${WG_IF}.conf ..."
-cat >"/etc/wireguard/${WG_IF}.conf" <<EOF
+  info "Writing /etc/wireguard/${WG_IF}.conf"
+  cat >"/etc/wireguard/${WG_IF}.conf" <<EOF
 [Interface]
 Address = ${WG_SERVER_ADDR}
 ListenPort = ${WG_PORT}
@@ -189,14 +246,16 @@ PublicKey = ${MT_PUB}
 AllowedIPs = ${WG_MT_ADDR}
 PersistentKeepalive = 25
 EOF
-chmod 600 "/etc/wireguard/${WG_IF}.conf"
+  chmod 600 "/etc/wireguard/${WG_IF}.conf"
 
-systemctl enable --now "wg-quick@${WG_IF}"
-sleep 1
-wg show >/dev/null || true
+  enable_service "wg-quick@${WG_IF}.service"
+  sleep 1
+  wg show >/dev/null || true
+}
 
-echo "[7] Configuring redsocks (TCP -> SOCKS ${SOCKS_PORT})..."
-cat >/etc/redsocks.conf <<EOF
+configure_redsocks_and_nft() {
+  info "Configuring redsocks"
+  cat >/etc/redsocks.conf <<EOF
 base {
   log_info = on;
   daemon = on;
@@ -211,62 +270,87 @@ redsocks {
   type = socks5;
 }
 EOF
-systemctl enable --now redsocks
+  enable_service redsocks.service
 
-echo "[8] Configuring nftables redirect ONLY from ${WG_IF} to redsocks..."
-NFT_PORT_SET="$(tcp_ports_to_nft_set "${TCP_PORTS}")"
-cat >/etc/nftables.conf <<EOF
+  info "Configuring nftables redirect from ${WG_IF} to redsocks"
+  local nft_port_set
+  nft_port_set="$(tcp_ports_to_nft_set "${TCP_PORTS}")"
+  cat >/etc/nftables.conf <<EOF
 flush ruleset
 table inet zap2 {
   chain prerouting {
     type nat hook prerouting priority -100; policy accept;
 
-    iifname "${WG_IF}" tcp dport ${NFT_PORT_SET} redirect to :${REDSOCKS_PORT}
+    iifname "${WG_IF}" tcp dport ${nft_port_set} redirect to :${REDSOCKS_PORT}
   }
 }
 EOF
-systemctl enable --now nftables
+  enable_service nftables.service
+}
 
-echo
-echo "===================== OUTPUT (WireGuard for MikroTik) ====================="
+print_summary() {
+  local pub_ip="$1"
 
-# If public IP not detected, ask now (once)
-if [[ -z "${PUB_IP}" ]]; then
-  read -r -p "Public IP/DNS for MikroTik to connect (endpoint): " PUB_IP
+  echo
+  echo "===================== OUTPUT (WireGuard for MikroTik) ====================="
+
+  if [[ -z "${pub_ip}" ]]; then
+    read -r -p "Public IP/DNS for MikroTik endpoint: " pub_ip
+  fi
+
+  echo
+  echo "SERVER (Linux) endpoint:"
+  echo "  ${pub_ip}:${WG_PORT}"
+  echo
+  echo "WireGuard addressing:"
+  echo "  Server WG address:   ${WG_SERVER_ADDR}"
+  echo "  MikroTik WG address: ${WG_MT_ADDR%/*}/24"
+  echo
+  echo "Server public key (paste to MikroTik peer public-key):"
+  echo "  ${SERVER_PUB}"
+  echo
+  echo "MikroTik PRIVATE key:"
+  echo "  ${MT_PRIV}"
+  echo "MikroTik PUBLIC key (already added on server peer):"
+  echo "  ${MT_PUB}"
+  echo
+  echo "MikroTik peer settings:"
+  echo "  endpoint-address = ${pub_ip}"
+  echo "  endpoint-port    = ${WG_PORT}"
+  echo "  allowed-address  = ${WG_SERVER_ADDR%/*}/32"
+  echo "  persistent-keepalive = 25s"
+  echo
+  echo "Quick checks on Linux:"
+  echo "  wg show"
+  echo "  nft -a list chain inet zap2 prerouting"
+  echo "  journalctl -u redsocks -n 50 --no-pager"
+  echo "  docker compose -f ${PROJECT_DIR}/docker-compose.yml ps"
+  echo "============================================================================"
+}
+
+need_root
+
+info "Detecting network..."
+DEF_IF="$(detect_default_iface || true)"
+if [[ -z "${DEF_IF}" ]]; then
+  err "Could not detect default interface. Check: ip route"
+  exit 1
 fi
+LOCAL_CIDR="$(detect_local_ip "${DEF_IF}")"
+LOCAL_IP="${LOCAL_CIDR%%/*}"
+PUB_IP="$(detect_public_ip || true)"
 
-echo
-echo "SERVER (Ubuntu) endpoint:"
-echo "  ${PUB_IP}:${WG_PORT}"
-echo
-echo "WireGuard addressing:"
-echo "  Server WG address:   ${WG_SERVER_ADDR}"
-echo "  MikroTik WG address: ${WG_MT_ADDR%/*}/24  (set 10.99.0.2/24 on MT)"
-echo
-echo "Server public key (paste to MikroTik peer public-key):"
-echo "  ${SERVER_PUB}"
-echo
-echo "MikroTik keys (generate once, paste into MikroTik wg interface):"
-echo "  MikroTik PRIVATE key:"
-echo "  ${MT_PRIV}"
-echo "  MikroTik PUBLIC key (already added on server peer):"
-echo "  ${MT_PUB}"
-echo
-echo "MikroTik peer settings (peer pointing to server):"
-echo "  endpoint-address = ${PUB_IP}"
-echo "  endpoint-port    = ${WG_PORT}"
-echo "  allowed-address  = ${WG_SERVER_ADDR%/*}/32"
-echo "  persistent-keepalive = 25s"
-echo
-echo "Routing hint on MikroTik:"
-echo "  For marked traffic, set gateway/next-hop to: ${WG_SERVER_ADDR%/*}"
-echo
-echo "QUIC note:"
-echo "  If you want this to work for HTTPS reliably, block UDP/443 for those clients on MikroTik."
-echo
-echo "Quick checks on Ubuntu:"
-echo "  wg show"
-echo "  nft -a list chain inet zap2 prerouting"
-echo "  journalctl -u redsocks -n 50 --no-pager"
-echo "  docker compose -f ${INSTALL_DIR}/docker-compose.yml ps"
-echo "============================================================================"
+info "default iface: ${DEF_IF}"
+info "local ip: ${LOCAL_CIDR:-unknown}"
+info "public ip: ${PUB_IP:-unknown}"
+
+install_pkgs
+ensure_docker_ready
+ensure_compose
+
+PROJECT_DIR="$(resolve_project_dir)"
+prepare_project_env "${PROJECT_DIR}"
+start_compose "${PROJECT_DIR}"
+configure_wireguard
+configure_redsocks_and_nft
+print_summary "${PUB_IP}"
