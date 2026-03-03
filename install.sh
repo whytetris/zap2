@@ -19,6 +19,7 @@ SOCKS_PORT="${SOCKS_PORT:-1080}"      # expected in ss-zapret(.env.example)
 REDSOCKS_PORT="${REDSOCKS_PORT:-12345}"
 TCP_PORTS="${TCP_PORTS:-80,443}"      # which TCP ports to send via socks
 # ================================================================
+COMPOSE_BIN=""
 
 err() {
   echo "[ERROR] $*" >&2
@@ -92,16 +93,27 @@ install_pkgs() {
     apt-get update -y
     apt-get install -y --no-install-recommends \
       ca-certificates curl git nano \
-      docker.io docker-compose-plugin \
+      docker.io \
       wireguard nftables redsocks \
       iproute2 tcpdump openssl
+
+    # Docker Compose package name differs by distro/repo setup.
+    if apt-cache show docker-compose-plugin >/dev/null 2>&1; then
+      apt-get install -y --no-install-recommends docker-compose-plugin || true
+    elif apt-cache show docker-compose-v2 >/dev/null 2>&1; then
+      apt-get install -y --no-install-recommends docker-compose-v2 || true
+    elif apt-cache show docker-compose >/dev/null 2>&1; then
+      apt-get install -y --no-install-recommends docker-compose || true
+    fi
   elif have_cmd dnf; then
     info "Installing packages via dnf..."
     dnf install -y \
       ca-certificates curl git nano \
-      docker docker-compose-plugin \
+      docker \
       wireguard-tools nftables redsocks \
       iproute tcpdump openssl
+
+    dnf install -y docker-compose-plugin || dnf install -y docker-compose || true
   else
     err "Unsupported package manager. Need apt-get or dnf."
     exit 1
@@ -132,9 +144,26 @@ ensure_docker_ready() {
 
 ensure_compose() {
   if docker compose version >/dev/null 2>&1; then
+    COMPOSE_BIN="docker compose"
     return 0
   fi
-  err "Docker Compose plugin is not available (docker compose)."
+
+  if have_cmd docker-compose; then
+    COMPOSE_BIN="docker-compose"
+    return 0
+  fi
+
+  # last attempt for Debian/Ubuntu where only legacy package may exist
+  if have_cmd apt-get; then
+    apt-get update -y
+    apt-get install -y --no-install-recommends docker-compose || true
+    if have_cmd docker-compose; then
+      COMPOSE_BIN="docker-compose"
+      return 0
+    fi
+  fi
+
+  err "Docker Compose is not available (tried: docker compose, docker-compose)."
   exit 1
 }
 
@@ -200,8 +229,8 @@ start_compose() {
   cd "${proj_dir}"
 
   if [[ -f "docker-compose.yml" || -f "docker-compose.yaml" ]]; then
-    docker compose up -d
-    docker compose ps
+    ${COMPOSE_BIN} up -d
+    ${COMPOSE_BIN} ps
   else
     err "No docker-compose.yml/yaml in ${proj_dir}"
     exit 1
@@ -324,7 +353,7 @@ print_summary() {
   echo "  wg show"
   echo "  nft -a list chain inet zap2 prerouting"
   echo "  journalctl -u redsocks -n 50 --no-pager"
-  echo "  docker compose -f ${PROJECT_DIR}/docker-compose.yml ps"
+  echo "  ${COMPOSE_BIN} -f ${PROJECT_DIR}/docker-compose.yml ps"
   echo "============================================================================"
 }
 
