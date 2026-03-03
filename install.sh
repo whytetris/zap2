@@ -38,6 +38,14 @@ need_root() {
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+compose() {
+  if [[ "${COMPOSE_BIN}" == "docker compose" ]]; then
+    docker compose "$@"
+  else
+    docker-compose "$@"
+  fi
+}
+
 rand_pw() {
   if have_cmd openssl; then
     openssl rand -base64 24 | tr -d '\n'
@@ -89,6 +97,16 @@ install_pkgs() {
   export DEBIAN_FRONTEND=noninteractive
 
   if have_cmd apt-get; then
+    if [[ -f /etc/os-release ]] && grep -qi '^ID=ubuntu' /etc/os-release; then
+      # Ubuntu cloud images may miss universe; compose/wireguard packages can live there.
+      if ! grep -Rhs "^[^#].*\\buniverse\\b" /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null | grep -q .; then
+        info "Enabling Ubuntu universe repository..."
+        apt-get update -y
+        apt-get install -y --no-install-recommends software-properties-common
+        add-apt-repository -y universe || true
+      fi
+    fi
+
     info "Installing packages via apt-get..."
     apt-get update -y
     apt-get install -y --no-install-recommends \
@@ -229,8 +247,8 @@ start_compose() {
   cd "${proj_dir}"
 
   if [[ -f "docker-compose.yml" || -f "docker-compose.yaml" ]]; then
-    ${COMPOSE_BIN} up -d
-    ${COMPOSE_BIN} ps
+    compose up -d
+    compose ps
   else
     err "No docker-compose.yml/yaml in ${proj_dir}"
     exit 1
@@ -348,6 +366,16 @@ print_summary() {
   echo "  endpoint-port    = ${WG_PORT}"
   echo "  allowed-address  = ${WG_SERVER_ADDR%/*}/32"
   echo "  persistent-keepalive = 25s"
+  echo
+  echo "Allowed-IPs summary:"
+  echo "  On server peer (MikroTik): ${WG_MT_ADDR}"
+  echo "  On MikroTik peer (server): ${WG_SERVER_ADDR%/*}/32"
+  echo
+  echo "Policy route gateway on MikroTik (for marked routes):"
+  echo "  ${WG_SERVER_ADDR%/*}"
+  echo
+  echo "QUIC note:"
+  echo "  Block UDP/443 for clients that must go through anti-DPI path."
   echo
   echo "Quick checks on Linux:"
   echo "  wg show"
