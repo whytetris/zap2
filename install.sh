@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 # Optional: pass repo URL. If omitted, installer uses current script directory as project root.
 REPO_URL="${1:-}"
+MODE="${MODE:-}"
 
 # ====== configurable defaults (override via env if you want) ======
 INSTALL_DIR="${INSTALL_DIR:-/opt/ss-zapret}"
@@ -37,6 +38,22 @@ need_root() {
 }
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+choose_mode() {
+  if [[ -n "${MODE}" ]]; then
+    return 0
+  fi
+
+  echo "Select mode:"
+  echo "  1) Install/update"
+  echo "  2) Uninstall everything"
+  read -r -p "Enter 1 or 2: " choice
+  case "${choice}" in
+    1) MODE="install" ;;
+    2) MODE="uninstall" ;;
+    *) err "Invalid choice"; exit 1 ;;
+  esac
+}
 
 compose() {
   if [[ "${COMPOSE_BIN}" == "docker compose" ]]; then
@@ -185,6 +202,20 @@ ensure_compose() {
   exit 1
 }
 
+detect_compose_soft() {
+  if docker compose version >/dev/null 2>&1; then
+    COMPOSE_BIN="docker compose"
+    return 0
+  fi
+
+  if have_cmd docker-compose; then
+    COMPOSE_BIN="docker-compose"
+    return 0
+  fi
+
+  return 1
+}
+
 resolve_project_dir() {
   if [[ -n "${REPO_URL}" ]]; then
     info "Using repository URL: ${REPO_URL}"
@@ -203,6 +234,68 @@ resolve_project_dir() {
   err "No repo URL provided and docker-compose file not found near script."
   err "Usage: sudo bash ${SCRIPT_NAME} <github_repo_url>"
   exit 1
+}
+
+uninstall_all() {
+  info "Uninstall mode: stopping services and removing configs..."
+
+  detect_compose_soft || true
+
+  if [[ -d "${INSTALL_DIR}" ]]; then
+    cd "${INSTALL_DIR}" || true
+    if [[ -n "${COMPOSE_BIN}" && ( -f "docker-compose.yml" || -f "docker-compose.yaml" ) ]]; then
+      compose down --remove-orphans --volumes || true
+    fi
+  fi
+
+  systemctl disable --now "wg-quick@${WG_IF}.service" 2>/dev/null || true
+  systemctl disable --now redsocks.service 2>/dev/null || true
+  systemctl disable --now nftables.service 2>/dev/null || true
+  systemctl disable --now docker.service 2>/dev/null || true
+  systemctl disable --now docker.socket 2>/dev/null || true
+
+  rm -f "/etc/wireguard/${WG_IF}.conf"
+  rm -f /etc/wireguard/server.key /etc/wireguard/server.pub
+  rm -f /etc/wireguard/mikrotik.key /etc/wireguard/mikrotik.pub
+  rm -f /etc/sysctl.d/99-zap2.conf
+  rm -f /etc/redsocks.conf
+  rm -f /etc/nftables.conf
+  rm -rf "${INSTALL_DIR}"
+
+  if have_cmd wg-quick; then
+    wg-quick down "${WG_IF}" 2>/dev/null || true
+  fi
+  if have_cmd nft; then
+    nft flush ruleset 2>/dev/null || true
+  fi
+
+  if have_cmd docker; then
+    docker system prune -af --volumes || true
+  fi
+
+  if have_cmd apt-get; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y || true
+    apt-get purge -y \
+      docker.io docker-compose-plugin docker-compose-v2 docker-compose \
+      wireguard wireguard-tools nftables redsocks \
+      iproute2 tcpdump openssl git curl nano ca-certificates \
+      containerd runc || true
+    apt-get autoremove -y --purge || true
+  elif have_cmd dnf; then
+    dnf remove -y \
+      docker docker-compose-plugin docker-compose \
+      wireguard-tools nftables redsocks \
+      iproute tcpdump openssl git curl nano ca-certificates || true
+    dnf autoremove -y || true
+  fi
+
+  sysctl -w net.ipv4.ip_forward=0 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.conf.all.rp_filter=1 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.conf.default.rp_filter=1 >/dev/null 2>&1 || true
+
+  info "Uninstall completed."
+  exit 0
 }
 
 prepare_project_env() {
@@ -386,6 +479,20 @@ print_summary() {
 }
 
 need_root
+choose_mode
+
+case "${MODE}" in
+  install|INSTALL|Install) MODE="install" ;;
+  uninstall|UNINSTALL|Uninstall|remove|REMOVE) MODE="uninstall" ;;
+  *)
+    err "Unknown MODE=${MODE}. Use install or uninstall."
+    exit 1
+    ;;
+esac
+
+if [[ "${MODE}" == "uninstall" ]]; then
+  uninstall_all
+fi
 
 info "Detecting network..."
 DEF_IF="$(detect_default_iface || true)"
